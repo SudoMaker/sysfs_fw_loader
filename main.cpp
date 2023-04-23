@@ -20,44 +20,48 @@
 #include <fstream>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 #include <cstdio>
 #include <cstdlib>
+#include <climits>
 
 #include <fcntl.h>
 #include <unistd.h>
 
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/inotify.h>
 
-#include "json.hpp"
-
-using json = nlohmann::json;
-
-
+#include <json-c/json.h>
 
 struct fw_entry {
 	std::string name;
 	std::string file;
-	bool done = false;
 };
 
 std::vector<fw_entry> fw_entries;
 
-void add_fw_entry(json &j) {
-	std::string s_name = j["name"];
-	std::string s_file = j["file"];
+__attribute__((noreturn)) inline void fdp(const std::string &err_str) {
+	throw std::system_error(errno, std::system_category(), err_str);
+}
 
-	fprintf(stderr, "Registered firmware: [%s] %s\n", s_name.c_str(), s_file.c_str());
+__attribute__((noreturn)) inline void putain(const std::string &err_str) {
+	throw std::logic_error(err_str);
+}
 
-	fw_entries.emplace_back(fw_entry{std::move(s_name), std::move(s_file)});
+void add_fw_entry(const char *name, const char *file) {
+	fprintf(stderr, "Registered firmware: [%s] %s\n", name, file);
+
+	fw_entries.emplace_back(fw_entry{name, file});
 }
 
 void write_file(const char *path, const void *data, size_t len) {
 	int fd = open(path, O_RDWR);
 
 	if (fd < 0)
-		throw std::system_error(errno, std::system_category(), std::string("failed to open file ") + path);
+		fdp(std::string("failed to open file ") + path);
 
 	size_t written = 0;
 
@@ -69,7 +73,7 @@ void write_file(const char *path, const void *data, size_t len) {
 		} else if (rc == 0) {
 			break;
 		} else {
-			throw std::system_error(errno, std::system_category(), std::string("failed to write file ") + path);
+			fdp(std::string("failed to write file ") + path);
 		}
 	}
 
@@ -87,12 +91,12 @@ void do_load_fw(const std::string &sysfs_path, const std::string &fw_path) {
 
 		struct stat sb;
 		if (fstat(fd_fw, &sb)) {
-			throw std::system_error(errno, std::system_category(), std::string("failed to stat file ") + loading_path);
+			fdp(std::string("failed to stat file ") + loading_path);
 		}
 
 		void *fw_data = mmap(nullptr, sb.st_size, PROT_READ, MAP_SHARED, fd_fw, 0);
 		if (fw_data == MAP_FAILED) {
-			throw std::system_error(errno, std::system_category(), std::string("failed to mmap file ") + loading_path);
+			fdp(std::string("failed to mmap file ") + loading_path);
 		}
 
 		write_file(data_path.c_str(), fw_data, sb.st_size);
@@ -104,7 +108,7 @@ void do_load_fw(const std::string &sysfs_path, const std::string &fw_path) {
 	write_file(loading_path.c_str(), "0\n", 2);
 }
 
-void try_load_fw(fw_entry &e) {
+bool try_load_fw(fw_entry &e) {
 	for (const auto &it : std::filesystem::directory_iterator("/sys/class/firmware/")) {
 		auto fn = it.path().filename().string();
 
@@ -112,49 +116,93 @@ void try_load_fw(fw_entry &e) {
 			fprintf(stderr, "Loading firmware: [%s] -> %s\n", e.name.c_str(), fn.c_str());
 
 			do_load_fw(it.path().string(), e.file);
-			e.done = true;
-			break;
+			return true;
 		}
 	}
+
+	return false;
 }
 
 int main() {
 	const char *config_dir = getenv("SYSFS_FW_LOADER_CONFIG_DIR");
+	const char *timeout_str = getenv("SYSFS_FW_LOADER_TIMEOUT");
 
 	if (!config_dir) {
 		config_dir = "/etc/sysfs_fw_loader/";
 	}
 
-	for (const auto &it : std::filesystem::directory_iterator(config_dir)) {
-		std::ifstream ifs(it.path().string());
-		json j;
-
-		ifs >> j;
-
-		if (j.is_object()) {
-			add_fw_entry(j);
-		} else if (j.is_array()) {
-			for (auto &iu: j) {
-				if (iu.is_object()) {
-					add_fw_entry(iu);
-				}
-			}
-		}
+	if (!timeout_str) {
+		timeout_str = "10";
 	}
 
-	while (1) {
-		size_t remaining = 0;
+	for (const auto &it : std::filesystem::directory_iterator(config_dir)) {
+		std::ifstream ifs(it.path().string());
+		ifs.seekg(0, std::ios::end);
+		auto file_size = ifs.tellg();
+		ifs.seekg(0, std::ios::beg);
 
-		for (auto &it: fw_entries) {
-			try_load_fw(it);
-			if (!it.done)
-				remaining++;
+		std::vector<uint8_t> buf(file_size);
+		ifs.read((char *)buf.data(), (int)file_size);
+		ifs.close();
+		buf.push_back(0);
+
+		struct json_object *j_arr;
+		j_arr = json_tokener_parse((char *)buf.data());
+
+		if (json_object_is_type(j_arr, json_type_array)) {
+			auto array_length = json_object_array_length(j_arr);
+
+			for (unsigned i=0; i<array_length; i++) {
+				struct json_object *j_obj = json_object_array_get_idx(j_arr, i);
+				struct json_object *name_object, *path_object;
+
+				if (!json_object_object_get_ex(j_obj, "name", &name_object)) {
+					putain("json error: no name field");
+				}
+
+				if (!json_object_object_get_ex(j_obj, "file", &path_object)) {
+					putain("json error: no file field");
+				}
+
+				const char *name = json_object_get_string(name_object);
+				const char *file = json_object_get_string(path_object);
+
+				add_fw_entry(name, file);
+			}
+		} else {
+			putain("json error: root node is not array");
 		}
 
-		if (remaining == 0)
-			break;
+		json_object_put(j_arr);
+	}
 
-		usleep(10 * 1000);
+	unsigned loaded_count = 0;
+	unsigned unchanged_count = 0;
+	unsigned timeout_secs = strtol(timeout_str, nullptr, 10);
+
+	while (1) {
+		unsigned last_loaded_count = loaded_count;
+
+		for (auto &it: fw_entries) {
+			if (try_load_fw(it)) {
+				loaded_count++;
+				unchanged_count = 0;
+			}
+		}
+
+		if (loaded_count == fw_entries.size()) {
+			break;
+		}
+
+		usleep(100 * 1000);
+
+		if (last_loaded_count == loaded_count) {
+			unchanged_count++;
+		}
+
+		if (unchanged_count > (100 * timeout_secs)) {
+			break;
+		}
 	}
 
 	return 0;

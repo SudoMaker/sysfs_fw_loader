@@ -41,12 +41,13 @@ Use an empty `file` field to indicate you want to instruct the kernel to skip lo
 
 You can use the environment variable `SYSFS_FW_LOADER_CONFIG_DIR` to specify an alternative config directory.
 
-This program will exit when all specified firmware files are loaded.
+This program will exit when all specified firmware files are loaded. You can use the environment variable `SYSFS_FW_LOADER_TIMEOUT` to specify a timeout in seconds. It's 10 by default.
 
 ## Build
 ### Requirements
 - CMake
 - C++17 compatible compiler with std::filesystem
+- json-c library
 
 ```shell
 mkdir build
@@ -57,12 +58,8 @@ make
 
 Or if you're in a hurry:
 ```shell
-g++ -std=c++17 main.cpp -o sysfs_fw_loader
+g++ -std=c++17 main.cpp -o sysfs_fw_loader -l json-c
 ```
-
-## Credits
-This program uses the following open source components:
-- nlohmann/json
 
 ## License
 AGPLv3
